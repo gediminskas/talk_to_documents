@@ -1,0 +1,15 @@
+# secrets and local config
+.env
+
+# local data: documents are never committed, but the README and the manifest are
+data/*
+!data/README.md
+!data/corpus.csv
+
+# local notes and caches (embedding models, LLM context cache)
+notes/
+.cache/
+
+# macOS and editors
+.DS_Store
+.idea/

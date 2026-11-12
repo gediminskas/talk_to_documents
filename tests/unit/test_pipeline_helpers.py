@@ -37,3 +37,13 @@ def test_collect_files(tmp_path):
 def test_e5_models_get_prefixes_other_models_do_not():
     assert _prefixes_for('intfloat/multilingual-e5-large') == (E5_QUERY_PREFIX, E5_PASSAGE_PREFIX)
     assert _prefixes_for('BAAI/bge-small-en-v1.5') == ('', '')
+
+
+def test_embedding_text_with_context_comes_first():
+    chunk = Chunk(0, None, 'Install > Docker', 'Run it.', 2)
+    assert build_embedding_text(chunk, 'About installing.') == (
+        'About installing.\nInstall > Docker\nRun it.'
+    )
+    plain = Chunk(1, 1, None, 'Plain text.', 2)
+    assert build_embedding_text(plain, 'Some context.') == 'Some context.\nPlain text.'
+    assert build_embedding_text(plain, '') == 'Plain text.'

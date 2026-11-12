@@ -23,7 +23,8 @@ console = Console()
 
 
 def friendly_errors(func: Callable) -> Callable:
-    """Show setup problems (database down, schema missing) as one red line, not a traceback."""
+    """Show setup problems (database down, schema missing, LLM not configured) as one red
+    line, not a traceback."""
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -37,9 +38,9 @@ def friendly_errors(func: Callable) -> Callable:
 
 
 class SearchMode(StrEnum):
+    hybrid = 'hybrid'
     vector = 'vector'
     keyword = 'keyword'
-    both = 'both'
 
 
 @app.callback()
@@ -70,6 +71,13 @@ def ingest(
     recursive: Annotated[
         bool, typer.Option('--recursive', '-r', help='Descend into subdirectories.')
     ] = False,
+    contextual: Annotated[
+        bool | None,
+        typer.Option(
+            '--contextual/--no-contextual',
+            help='Ask the LLM for a context per chunk (default: the CONTEXTUAL setting).',
+        ),
+    ] = None,
 ) -> None:
     """Ingest PDF, Markdown and TXT files."""
     from talk_to_documents.ingest.pipeline import ingest_path
@@ -78,18 +86,20 @@ def ingest(
         console.print(f'[red]Not found:[/red] {path}')
         raise typer.Exit(1)
 
-    outcomes = ingest_path(path, tag, recursive)
+    outcomes = ingest_path(path, tag, recursive, contextual=contextual)
 
     table = Table(show_header=True, header_style='bold')
-    for column in ('file', 'status', 'chunks', 'seconds'):
+    for column in ('file', 'status', 'chunks', 'contexts', 'seconds'):
         table.add_column(column)
     failures = []
     for outcome in outcomes:
         if outcome.result:
             r = outcome.result
-            table.add_row(outcome.path.name, r.status, str(r.chunks), f'{r.seconds:.1f}')
+            table.add_row(
+                outcome.path.name, r.status, str(r.chunks), str(r.contexts), f'{r.seconds:.1f}'
+            )
         else:
-            table.add_row(outcome.path.name, '[red]failed[/red]', '-', '-')
+            table.add_row(outcome.path.name, '[red]failed[/red]', '-', '-', '-')
             failures.append(outcome)
     console.print(table)
 
@@ -138,40 +148,65 @@ def delete_cmd(
     console.print(f'deleted: {title}')
 
 
-def _print_hits(heading: str, hits: list, score_label: str) -> None:
-    console.print(f'\n[bold]{heading}[/bold]')
-    if not hits:
-        console.print('  (no results)')
-        return
-    table = Table(show_header=True, header_style='bold')
-    for column in ('#', score_label, 'document', 'page', 'text'):
-        table.add_column(column, overflow='fold')
-    for rank, hit in enumerate(hits, start=1):
-        snippet = ' '.join(hit.content.split())[:200]
-        table.add_row(str(rank), f'{hit.score:.3f}', hit.title, str(hit.page or '-'), snippet)
-    console.print(table)
-
-
 @app.command('search')
 @friendly_errors
 def search(
     query: Annotated[str, typer.Argument(help='What to look for.')],
-    mode: Annotated[SearchMode, typer.Option('--mode', '-m')] = SearchMode.both,
+    mode: Annotated[SearchMode, typer.Option('--mode', '-m')] = SearchMode.hybrid,
+    rerank: Annotated[
+        bool,
+        typer.Option('--rerank/--no-rerank', help='Rescore the top hits with a cross-encoder.'),
+    ] = False,
     top_k: Annotated[int, typer.Option('--top-k', '-k', min=1, max=50)] = 5,
+    source_type: Annotated[
+        str | None, typer.Option('--source-type', help='upload, conversation or note.')
+    ] = None,
+    tag: Annotated[
+        list[str] | None,
+        typer.Option('--tag', '-t', help='Only documents with a tag (repeatable).'),
+    ] = None,
 ) -> None:
-    """Search. Day 1 prints the vector and keyword lists separately (fusion comes on Day 2)."""
-    from talk_to_documents.retrieval.search import keyword_search, vector_search
+    """Search: vector, keyword, or both fused with RRF; optionally reranked."""
+    from talk_to_documents.retrieval.hybrid import hybrid_search
 
     with get_connection() as conn:
-        if mode in (SearchMode.vector, SearchMode.both):
-            from talk_to_documents.retrieval.embed import get_embedder
+        result = hybrid_search(
+            conn,
+            query,
+            mode=mode.value,
+            top_k=top_k,
+            rerank=rerank,
+            source_type=source_type,
+            tags=tag,
+        )
 
-            query_vector = get_embedder().embed_query(query)
-            _print_hits(
-                'Vector search (cosine similarity)', vector_search(conn, query_vector, top_k), 'sim'
+    if not result.hits:
+        console.print('(no results)')
+    else:
+        score_label = 'rerank' if rerank else ('rrf' if mode == SearchMode.hybrid else 'score')
+        table = Table(show_header=True, header_style='bold')
+        for column in ('#', score_label, 'vec', 'kw', 'document', 'page', 'text'):
+            table.add_column(column, overflow='fold')
+        for position, fused in enumerate(result.hits, start=1):
+            hit = fused.hit
+            score = fused.rerank_score if fused.rerank_score is not None else fused.score
+            snippet = ' '.join(hit.content.split())[:200]
+            table.add_row(
+                str(position),
+                f'{score:.3f}',
+                str(fused.ranks.get('vector', '-')),
+                str(fused.ranks.get('keyword', '-')),
+                hit.title,
+                str(hit.page or '-'),
+                snippet,
             )
-        if mode in (SearchMode.keyword, SearchMode.both):
-            _print_hits('Keyword search (ts_rank_cd)', keyword_search(conn, query, top_k), 'rank')
+        console.print(table)
+
+    t = result.timings
+    console.print(
+        f'[dim]embed {t.embed_ms:.0f} ms | vector {t.vector_ms:.0f} | keyword {t.keyword_ms:.0f} '
+        f'| fuse {t.fuse_ms:.0f} | rerank {t.rerank_ms:.0f} | total {t.total_ms:.0f}[/dim]'
+    )
 
 
 if __name__ == '__main__':

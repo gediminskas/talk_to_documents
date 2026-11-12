@@ -11,6 +11,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from talk_to_documents.config import Settings, settings
 from talk_to_documents.db import init_schema
+from talk_to_documents.llm import LLMError, LLMResponse
 
 TEST_DB_NAME = 'ttd_test'
 DIM = 1024
@@ -24,6 +25,8 @@ def pytest_collection_modifyitems(items):
             item.add_marker(pytest.mark.integration)
         if 'model' in parts:
             item.add_marker(pytest.mark.model)
+        if 'llm' in parts:
+            item.add_marker(pytest.mark.llm)
 
 
 def _url_for(dbname: str) -> str:
@@ -63,9 +66,55 @@ class WrongDimEmbedder(FakeEmbedder):
         return np.ones((len(texts), 8), dtype=np.float32)
 
 
+class FakeLLM:
+    """Records every call. `reply` is a string, or a function (system, user) -> string."""
+
+    def __init__(self, reply='A short context.', fail_times=0):
+        self.reply = reply
+        self.fail_times = fail_times  # fail this many calls first, then succeed
+        self.calls: list[dict] = []
+
+    def complete(self, system, user, max_tokens=512, temperature=0.0, model=None):
+        self.calls.append(
+            {'system': system, 'user': user, 'max_tokens': max_tokens, 'model': model}
+        )
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise LLMError('simulated failure')
+        text = self.reply(system, user) if callable(self.reply) else self.reply
+        return LLMResponse(text=text, input_tokens=None, output_tokens=None, seconds=0.0)
+
+
+class AlwaysFailingLLM(FakeLLM):
+    def __init__(self):
+        super().__init__(fail_times=10**9)
+
+
+class FakeReranker:
+    """Scores a text by how many query words it contains."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        self.calls.append((query, list(texts)))
+        words = set(query.lower().split())
+        return [float(len(words & set(text.lower().split()))) for text in texts]
+
+
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
+
+
+@pytest.fixture
+def fake_llm() -> FakeLLM:
+    return FakeLLM()
+
+
+@pytest.fixture
+def fake_reranker() -> FakeReranker:
+    return FakeReranker()
 
 
 @pytest.fixture

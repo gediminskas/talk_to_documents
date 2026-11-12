@@ -1,4 +1,7 @@
-"""Ingestion pipeline: file -> parse -> chunk -> embed -> store (one transaction per file)."""
+"""Ingestion pipeline: file -> parse -> chunk -> (contexts) -> embed -> store.
+
+Each file is written in one transaction, so a failure leaves nothing behind.
+"""
 
 import hashlib
 import logging
@@ -17,7 +20,13 @@ from talk_to_documents.config import Settings
 from talk_to_documents.config import settings as default_settings
 from talk_to_documents.db import get_connection
 from talk_to_documents.ingest.chunker import Chunk, chunk_blocks, hf_token_counter
+from talk_to_documents.ingest.contextual import (
+    PROMPT_VERSION,
+    ContextCache,
+    generate_contexts,
+)
 from talk_to_documents.ingest.parser import ALLOWED_EXTENSIONS, ParseError, parse_file
+from talk_to_documents.llm import LLM
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +45,7 @@ class IngestResult:
     document_id: UUID | None
     chunks: int
     seconds: float
+    contexts: int = 0  # chunks that received an LLM-written context
 
 
 @dataclass(frozen=True)
@@ -53,12 +63,11 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_embedding_text(chunk: Chunk) -> str:
-    """Text that is embedded and indexed for keywords: heading path (if any) plus content.
-    The stored `content` stays clean for display."""
-    if chunk.heading_path:
-        return f'{chunk.heading_path}\n{chunk.content}'
-    return chunk.content
+def build_embedding_text(chunk: Chunk, context: str = '') -> str:
+    """Text that is embedded and keyword-indexed: context (if any), heading path (if any),
+    then content. The stored `content` stays clean for display."""
+    parts = [context, chunk.heading_path or '', chunk.content]
+    return '\n'.join(part for part in parts if part)
 
 
 def collect_files(path: Path, recursive: bool = False) -> list[Path]:
@@ -78,9 +87,15 @@ def ingest_file(
     conn: psycopg.Connection | None = None,
     embedder: PassageEmbedder | None = None,
     count_tokens: Callable[[str], int] | None = None,
+    contextual: bool | None = None,
+    llm: LLM | None = None,
+    context_cache: ContextCache | None = None,
     settings: Settings = default_settings,
 ) -> IngestResult:
-    """Ingest one file. Raises ParseError for unreadable files. Writes nothing on failure."""
+    """Ingest one file. Raises ParseError for unreadable files. Writes nothing on failure.
+
+    `contextual=None` means: use the CONTEXTUAL setting.
+    """
     path = Path(path)
     started = perf_counter()
 
@@ -92,6 +107,9 @@ def ingest_file(
                 conn=own_conn,
                 embedder=embedder,
                 count_tokens=count_tokens,
+                contextual=contextual,
+                llm=llm,
+                context_cache=context_cache,
                 settings=settings,
             )
 
@@ -121,7 +139,37 @@ def ingest_file(
     if not chunks:
         raise ParseError(f'{path.name}: produced no chunks')
 
-    texts = [build_embedding_text(chunk) for chunk in chunks]
+    metadata: dict = {'blocks': len(parsed.blocks), 'chunks': len(chunks)}
+    contexts = [''] * len(chunks)
+    use_contextual = settings.contextual if contextual is None else contextual
+    if use_contextual:
+        if llm is None:
+            from talk_to_documents.llm import get_llm
+
+            llm = get_llm(settings)
+        if context_cache is None:
+            context_cache = ContextCache(settings.context_cache_path)
+        context_model = settings.context_model or settings.llm_model or 'unknown'
+        result = generate_contexts(
+            parsed.title,
+            '\n\n'.join(block.text for block in parsed.blocks),
+            chunks,
+            llm,
+            model=context_model,
+            max_doc_tokens=settings.context_max_doc_tokens,
+            max_output_tokens=settings.context_max_output_tokens,
+            count_tokens=count_tokens,
+            cache=context_cache,
+            max_chunks=settings.context_max_chunks_per_doc,
+        )
+        contexts = result.contexts
+        metadata.update(
+            contextual='failed' if result.failed else True,
+            context_model=context_model,
+            prompt_version=PROMPT_VERSION,
+        )
+
+    texts = [build_embedding_text(chunk, ctx) for chunk, ctx in zip(chunks, contexts, strict=True)]
     vectors = embedder.embed_passages(texts)  # before the transaction, so it stays short
 
     try:
@@ -140,7 +188,7 @@ def ingest_file(
                     settings.fts_config,
                     embedder.model_name,
                     tags or [],
-                    Json({'blocks': len(parsed.blocks), 'chunks': len(chunks)}),
+                    Json(metadata),
                 ),
             ).fetchone()[0]
 
@@ -148,9 +196,9 @@ def ingest_file(
                 cur.executemany(
                     """
                     INSERT INTO chunks
-                      (document_id, ordinal, page, heading_path, content, token_count,
-                       embedding, tsv)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, to_tsvector(%s::regconfig, %s))
+                      (document_id, ordinal, page, heading_path, content, context_prefix,
+                       token_count, embedding, tsv)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, to_tsvector(%s::regconfig, %s))
                     """,
                     [
                         (
@@ -159,12 +207,15 @@ def ingest_file(
                             chunk.page,
                             chunk.heading_path,
                             chunk.content,
+                            ctx or None,
                             chunk.token_count,
                             vector,
                             settings.fts_config,
                             text,
                         )
-                        for chunk, vector, text in zip(chunks, vectors, texts, strict=True)
+                        for chunk, ctx, vector, text in zip(
+                            chunks, contexts, vectors, texts, strict=True
+                        )
                     ],
                 )
     except psycopg.errors.UniqueViolation:
@@ -174,7 +225,13 @@ def ingest_file(
 
     conn.commit()
     result = IngestResult(
-        'ingested', path.name, parsed.title, document_id, len(chunks), perf_counter() - started
+        'ingested',
+        path.name,
+        parsed.title,
+        document_id,
+        len(chunks),
+        perf_counter() - started,
+        contexts=sum(1 for ctx in contexts if ctx),
     )
     logger.info('ingested %s: %d chunks in %.1fs', path.name, result.chunks, result.seconds)
     return result
@@ -188,6 +245,9 @@ def ingest_path(
     conn: psycopg.Connection | None = None,
     embedder: PassageEmbedder | None = None,
     count_tokens: Callable[[str], int] | None = None,
+    contextual: bool | None = None,
+    llm: LLM | None = None,
+    context_cache: ContextCache | None = None,
     settings: Settings = default_settings,
 ) -> list[FileOutcome]:
     """Ingest a file or a directory. One failing file never stops the others."""
@@ -202,8 +262,21 @@ def ingest_path(
                 conn=own_conn,
                 embedder=embedder,
                 count_tokens=count_tokens,
+                contextual=contextual,
+                llm=llm,
+                context_cache=context_cache,
                 settings=settings,
             )
+
+    # Create the LLM client and the context cache once for the whole run, not per file.
+    if settings.contextual if contextual is None else contextual:
+        contextual = True
+        if llm is None:
+            from talk_to_documents.llm import get_llm
+
+            llm = get_llm(settings)
+        if context_cache is None:
+            context_cache = ContextCache(settings.context_cache_path)
 
     outcomes: list[FileOutcome] = []
     for file in files:
@@ -214,6 +287,9 @@ def ingest_path(
                 conn=conn,
                 embedder=embedder,
                 count_tokens=count_tokens,
+                contextual=contextual,
+                llm=llm,
+                context_cache=context_cache,
                 settings=settings,
             )
             outcomes.append(FileOutcome(file, result=result))

@@ -13,7 +13,7 @@ from rich.table import Table
 
 from eval.dataset import DatasetError, load_questions, validate
 from talk_to_documents.db import get_connection
-from talk_to_documents.ingest.parsers import ALLOWED_EXTENSIONS, ParseError, parse_file
+from talk_to_documents.ingest.parser import ALLOWED_EXTENSIONS, ParseError, parse_file
 
 
 def parse_corpus(corpus_dir: Path, max_upload_mb: int = 50) -> dict[str, str]:

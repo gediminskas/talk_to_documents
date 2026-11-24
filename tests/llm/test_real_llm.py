@@ -18,5 +18,7 @@ def test_simple_completion():
 
 
 def test_system_prompt_and_temperature_zero_are_accepted():
-    response = get_llm().complete('You answer in one word.', 'Capital of Lithuania?', max_tokens=400)
+    response = get_llm().complete(
+        'You answer in one word.', 'Capital of Lithuania?', max_tokens=400
+    )
     assert 'vilnius' in response.text.lower()

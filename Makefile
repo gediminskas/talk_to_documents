@@ -1,4 +1,5 @@
-.PHONY: up down db-init test test-int test-model test-all lint fmt
+.PHONY: up down db-init test test-int test-model test-llm test-all lint fmt \
+	draft-questions eval-validate eval-retrieval eval
 
 up:
 	docker compose up -d db
@@ -21,6 +22,10 @@ test-int:
 test-model:
 	uv run pytest -m model
 
+# calls your real LLM server (LLM_* in .env)
+test-llm:
+	uv run pytest -m llm
+
 test-all:
 	uv run pytest -m ""
 
@@ -31,3 +36,21 @@ lint:
 fmt:
 	uv run ruff check --fix .
 	uv run ruff format .
+
+# --- evaluation (Day 3) ---
+
+# draft candidate questions with the LLM (you must review them by hand)
+draft-questions:
+	uv run python -m eval.draft_questions
+
+# check eval/questions.jsonl against the database and the corpus files
+eval-validate:
+	uv run python -m eval.validate_dataset
+
+# retrieval metrics for all configurations, no LLM needed
+eval-retrieval:
+	uv run python -m eval.run_eval --no-generate
+
+# everything: retrieval plus generated answers and judging
+eval:
+	uv run python -m eval.run_eval --generate

@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_timeout_seconds: float = 120.0
 
+    # Evaluation (Day 3): the judge may be a different, stronger model than the generator.
+    # Each judge value falls back to the matching LLM_* value when it is empty.
+    judge_llm_base_url: str | None = None
+    judge_llm_api_key: str | None = None
+    judge_llm_model: str | None = None
+    # Optional prices in your currency per million tokens, used to report cost per query.
+    llm_price_in_per_mtok: float = 0.0
+    llm_price_out_per_mtok: float = 0.0
+
     # Contextual retrieval (Day 2): an LLM writes a short context for every chunk at ingest time
     contextual: bool = False
     context_model: str | None = None  # empty means: use llm_model
@@ -40,7 +49,16 @@ class Settings(BaseSettings):
     context_max_chunks_per_doc: int = 300
     context_cache_path: str = './.cache/contexts.jsonl'
 
-    @field_validator('llm_base_url', 'llm_api_key', 'llm_model', 'context_model', mode='before')
+    @field_validator(
+        'llm_base_url',
+        'llm_api_key',
+        'llm_model',
+        'context_model',
+        'judge_llm_base_url',
+        'judge_llm_api_key',
+        'judge_llm_model',
+        mode='before',
+    )
     @classmethod
     def _empty_string_is_none(cls, value: object) -> object:
         # An empty `CONTEXT_MODEL=` line in .env should mean "not set".

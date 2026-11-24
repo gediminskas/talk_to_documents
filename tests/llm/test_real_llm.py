@@ -12,11 +12,11 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_simple_completion():
-    response = get_llm().complete(None, 'Reply with the single word OK.', max_tokens=50)
+    response = get_llm().complete(None, 'Reply with the single word OK.', max_tokens=400)
     assert response.text.strip()
     assert response.seconds > 0
 
 
 def test_system_prompt_and_temperature_zero_are_accepted():
-    response = get_llm().complete('You answer in one word.', 'Capital of Lithuania?', max_tokens=50)
+    response = get_llm().complete('You answer in one word.', 'Capital of Lithuania?', max_tokens=400)
     assert 'vilnius' in response.text.lower()
